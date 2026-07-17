@@ -1,0 +1,11 @@
+[package]
+name = "dirclone"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.11", features = ["derive"] }
+reqwest = { version = "0.12.5", default-features = false, features = ["blocking", "rustls-tls"] }
+scraper = "0.19.1"
+url = "2.5.2"
