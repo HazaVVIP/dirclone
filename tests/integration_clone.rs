@@ -10,6 +10,7 @@ fn base_config(root_url: Url, output: std::path::PathBuf) -> AppConfig {
         root_url,
         output,
         timeout_seconds: 10,
+        connect_timeout: 5,
         user_agent: "dirclone-test".to_string(),
         retries: 1,
         retry_backoff_ms: 1,
@@ -18,9 +19,11 @@ fn base_config(root_url: Url, output: std::path::PathBuf) -> AppConfig {
         excludes: vec![],
         dry_run: false,
         concurrency: 2,
+        depth: None,
         force: false,
         manifest: ".manifest.json".into(),
         log_level: LogLevel::Quiet,
+        no_progress: true,
     }
 }
 
@@ -231,6 +234,95 @@ async fn conditional_get_skips_unchanged_file() {
     assert_eq!(content, "hello");
 
     a.assert();
+}
+
+/// `--depth N` stops recursion at N levels below the root. With `depth=1`,
+/// the root listing and its direct children fetch; grandchildren must not.
+#[tokio::test]
+async fn depth_cap_blocks_deeper_directories() {
+    let mut server = Server::new_async().await;
+    let _root = server
+        .mock("GET", "/root/")
+        .with_status(200)
+        .with_body("a.txt\nsub/\n")
+        .create_async()
+        .await;
+    let _a = server
+        .mock("GET", "/root/a.txt")
+        .with_status(200)
+        .with_body("hi")
+        .create_async()
+        .await;
+    let _sub = server
+        .mock("GET", "/root/sub/")
+        .with_status(200)
+        .with_body("b.txt\ndeep/\n")
+        .create_async()
+        .await;
+    let _b = server
+        .mock("GET", "/root/sub/b.txt")
+        .with_status(200)
+        .with_body("hey")
+        .create_async()
+        .await;
+    // If dirclone descends into /root/sub/deep/ despite --depth=1, mockito
+    // records a hit here. We ensure it does NOT by making the mock's
+    // expected() equal 0 and calling .assert() at the end.
+    let deep = server
+        .mock("GET", "/root/sub/deep/")
+        .with_status(200)
+        .with_body("")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let tmp = tempdir().unwrap();
+    let root_url = Url::parse(&format!("{}/root/", server.url())).unwrap();
+    let mut config = base_config(root_url, tmp.path().to_path_buf());
+    config.depth = Some(1);
+
+    let status = crawler::run(&config).await.unwrap();
+    assert_eq!(status, FinalStatus::Success);
+    assert!(tmp.path().join("a.txt").exists());
+    assert!(tmp.path().join("sub/b.txt").exists());
+    // Grandchild directory must not have been fetched, so no local dir either.
+    assert!(!tmp.path().join("sub/deep").exists());
+    deep.assert();
+}
+
+/// `--depth 0` means "only files at the root listing" — no recursion at all.
+#[tokio::test]
+async fn depth_zero_downloads_only_root_files() {
+    let mut server = Server::new_async().await;
+    let _root = server
+        .mock("GET", "/root/")
+        .with_status(200)
+        .with_body("a.txt\nsub/\n")
+        .create_async()
+        .await;
+    let _a = server
+        .mock("GET", "/root/a.txt")
+        .with_status(200)
+        .with_body("hi")
+        .create_async()
+        .await;
+    let sub = server
+        .mock("GET", "/root/sub/")
+        .with_status(200)
+        .with_body("")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let tmp = tempdir().unwrap();
+    let root_url = Url::parse(&format!("{}/root/", server.url())).unwrap();
+    let mut config = base_config(root_url, tmp.path().to_path_buf());
+    config.depth = Some(0);
+
+    crawler::run(&config).await.unwrap();
+    assert!(tmp.path().join("a.txt").exists());
+    assert!(!tmp.path().join("sub").exists());
+    sub.assert();
 }
 
 /// Defect #2: the manifest must be crash-safe (atomic, reloadable) so a killed
