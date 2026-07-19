@@ -72,6 +72,18 @@ pub enum LogLevel {
     Debug,
 }
 
+pub fn log_info(log_level: LogLevel, message: &str) {
+    if log_level >= LogLevel::Info {
+        eprintln!("{message}");
+    }
+}
+
+pub fn log_debug(log_level: LogLevel, message: &str) {
+    if log_level >= LogLevel::Debug {
+        eprintln!("[debug] {message}");
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub root_url: Url,
