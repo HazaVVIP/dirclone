@@ -2,6 +2,7 @@ pub mod cli;
 pub mod crawler;
 pub mod errors;
 pub mod fetcher;
+pub mod manifest;
 pub mod models;
 pub mod parser;
 pub mod store;

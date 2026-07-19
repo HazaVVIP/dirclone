@@ -185,3 +185,96 @@ async fn directory_traversal_is_concurrent() {
         high_water.load(Ordering::SeqCst)
     );
 }
+
+/// Defect #3: a second run against a server that answers 304 Not Modified must
+/// not re-download the body. The server should see exactly one body fetch.
+#[tokio::test]
+async fn conditional_get_skips_unchanged_file() {
+    let mut server = Server::new_async().await;
+    let _root = server
+        .mock("GET", "/root/")
+        .with_status(200)
+        .with_body("a.txt\n")
+        .create_async()
+        .await;
+    // The file is fetched exactly once across both runs: second run gets a 304.
+    let a = server
+        .mock("GET", "/root/a.txt")
+        .with_status(200)
+        .with_header("content-type", "text/plain")
+        .with_header("etag", "\"v1\"")
+        .with_body("hello")
+        .expect(1)
+        .create_async()
+        .await;
+
+    let tmp = tempdir().unwrap();
+    let root_url = Url::parse(&format!("{}/root/", server.url())).unwrap();
+    let config = base_config(root_url, tmp.path().to_path_buf());
+
+    // First run: downloads, records etag.
+    assert_eq!(crawler::run(&config).await.unwrap(), FinalStatus::Success);
+    assert!(tmp.path().join("a.txt").exists());
+
+    // Replace the mock with a 304 responder for the second run. Mockito matches
+    // later-created mocks first, so this shadows the 200 without re-fetching body.
+    let _not_modified = server
+        .mock("GET", "/root/a.txt")
+        .with_status(304)
+        .with_header("etag", "\"v1\"")
+        .create_async()
+        .await;
+
+    assert_eq!(crawler::run(&config).await.unwrap(), FinalStatus::Success);
+    // File still present and unchanged.
+    let content = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert_eq!(content, "hello");
+
+    a.assert();
+}
+
+/// Defect #2: the manifest must be crash-safe (atomic, reloadable) so a killed
+/// run can resume. We exercise the ManifestStore contract directly: after a
+/// checkpoint, a fresh load sees the recorded entry.
+#[tokio::test]
+async fn manifest_checkpoint_is_persistent_and_reloadable() {
+    use dirclone::manifest::ManifestStore;
+    use dirclone::models::ManifestEntry;
+
+    let tmp = tempdir().unwrap();
+    let manifest_path = tmp.path().join(".manifest.json");
+
+    let store = ManifestStore::load(&manifest_path).await.unwrap();
+    store
+        .record(
+            "http://example/root/a.txt".to_string(),
+            ManifestEntry {
+                local_path: "a.txt".to_string(),
+                size: 5,
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+    // Before checkpoint: nothing on disk.
+    assert!(!manifest_path.exists());
+
+    store.checkpoint().await.unwrap();
+    assert!(manifest_path.exists());
+
+    // Reload and verify the entry survived.
+    let reloaded = ManifestStore::load(&manifest_path).await.unwrap();
+    let m = reloaded.lock().await;
+    let entry = m
+        .files
+        .get("http://example/root/a.txt")
+        .expect("entry lost");
+    assert_eq!(entry.size, 5);
+    assert_eq!(entry.etag.as_deref(), Some("\"v1\""));
+
+    // Idempotent: a checkpoint with no new writes is a no-op (still valid JSON).
+    drop(m);
+    reloaded.checkpoint().await.unwrap();
+    serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&manifest_path).unwrap())
+        .unwrap();
+}

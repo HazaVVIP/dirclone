@@ -1,6 +1,7 @@
 use crate::cli::{AppConfig, log_debug, log_info};
 use crate::errors::FinalStatus;
 use crate::fetcher::{self, FileFetch, ListingFetch, ResumeHints, RetryConfig};
+use crate::manifest::ManifestStore;
 use crate::models::{DownloadTask, Manifest, ManifestEntry, Stats};
 use crate::parser::parse_listing_entries;
 use crate::store::write_atomic;
@@ -16,6 +17,11 @@ use std::time::Duration;
 use tokio::fs;
 use url::Url;
 
+/// Records between manifest checkpoints. Bounds how much progress a crash can
+/// erase. ponytail: ceiling = time-based checkpoint (flush every N seconds) if
+/// the per-record counter ever proves too coarse for huge files.
+const CHECKPOINT_INTERVAL: usize = 50;
+
 pub async fn run(config: &AppConfig) -> Result<FinalStatus> {
     if !config.dry_run {
         fs::create_dir_all(&config.output).await.with_context(|| {
@@ -27,7 +33,13 @@ pub async fn run(config: &AppConfig) -> Result<FinalStatus> {
     }
 
     let manifest_path = resolve_manifest_path(config);
-    let manifest = load_manifest(&manifest_path).await?;
+    let manifest = if config.dry_run {
+        // dry-run never writes; an in-memory store keeps the resume logic honest
+        // without touching disk.
+        ManifestStore::for_memory()
+    } else {
+        ManifestStore::load(&manifest_path).await?
+    };
 
     let matcher = build_matcher(&config.includes, &config.excludes)?;
     let retry = RetryConfig {
@@ -45,11 +57,34 @@ pub async fn run(config: &AppConfig) -> Result<FinalStatus> {
     let cfg = Arc::new(config.clone());
     let matcher = Arc::new(matcher);
     let client = Arc::new(client);
-    let manifest = Arc::new(tokio::sync::Mutex::new(manifest));
+    let manifest = Arc::new(manifest);
+
+    // SIGINT/SIGTERM handler: flush the manifest once, then re-raise so the
+    // process actually exits. A best-effort flush — if it errors we still exit.
+    let sig_manifest = manifest.clone();
+    let sig_path = manifest_path.clone();
+    let stop = {
+        let log_level = config.log_level;
+        tokio::task::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                log_info(log_level, "Interrupted - flushing manifest…");
+                if !sig_manifest.is_dry_run() {
+                    let _ = sig_manifest.checkpoint().await;
+                }
+                log_info(
+                    log_level,
+                    &format!("Manifest flushed to {}", sig_path.display()),
+                );
+                // Re-raise as an interrupt-style exit (128 + SIGINT = 130).
+                std::process::exit(130);
+            }
+        })
+    };
 
     let mut visited = HashSet::new();
     let mut queue = vec![config.root_url.clone()];
     let mut stats = Stats::default();
+    let mut since_checkpoint: usize = 0;
 
     let concurrency = config.concurrency.max(1);
 
@@ -141,14 +176,32 @@ pub async fn run(config: &AppConfig) -> Result<FinalStatus> {
             .collect::<Vec<_>>()
             .await;
 
-        apply_outcomes(&manifest, &mut stats, outcomes).await;
+        let downloaded = apply_outcomes(&manifest, &mut stats, outcomes).await;
+
+        // Checkpoint periodically so a crash erases at most CHECKPOINT_INTERVAL
+        // records of progress (defect #2: previously written only at the end).
+        since_checkpoint += downloaded;
+        if !config.dry_run && since_checkpoint >= CHECKPOINT_INTERVAL {
+            if let Err(err) = manifest.checkpoint().await {
+                log_info(
+                    config.log_level,
+                    &format!("Manifest checkpoint failed: {err:#}"),
+                );
+                stats.warnings += 1;
+            }
+            since_checkpoint = 0;
+        }
     }
 
-    let manifest_inner = manifest.lock().await;
+    // Final flush.
     if !config.dry_run {
-        save_manifest(&manifest_path, &manifest_inner).await?;
+        manifest
+            .checkpoint()
+            .await
+            .with_context(|| format!("failed to write manifest {}", manifest_path.display()))?;
     }
 
+    stop.abort();
     stats.summarize();
     Ok(stats.final_status())
 }
@@ -163,7 +216,7 @@ enum TaskOutcome {
 async fn process_single_task(
     client: &Client,
     config: &AppConfig,
-    manifest: &tokio::sync::Mutex<Manifest>,
+    manifest: &ManifestStore,
     retry: RetryConfig,
     task: DownloadTask,
 ) -> TaskOutcome {
@@ -222,22 +275,26 @@ async fn process_single_task(
     }
 }
 
+/// Apply outcomes to the manifest store; returns the number newly downloaded so
+/// the caller can drive checkpoint cadence.
 async fn apply_outcomes(
-    manifest: &tokio::sync::Mutex<Manifest>,
+    manifest: &ManifestStore,
     stats: &mut Stats,
     outcomes: Vec<TaskOutcome>,
-) {
-    let mut m = manifest.lock().await;
+) -> usize {
+    let mut downloaded = 0usize;
     for outcome in outcomes {
         match outcome {
             TaskOutcome::Downloaded { url, entry } => {
-                m.files.insert(normalize_url(&url), entry);
+                manifest.record(normalize_url(&url), entry).await;
                 stats.files_downloaded += 1;
+                downloaded += 1;
             }
             TaskOutcome::Skipped => stats.files_skipped += 1,
             TaskOutcome::Failed => stats.files_failed += 1,
         }
     }
+    downloaded
 }
 
 #[derive(Debug)]
@@ -344,33 +401,6 @@ fn resolve_manifest_path(config: &AppConfig) -> PathBuf {
     } else {
         config.output.join(&config.manifest)
     }
-}
-
-async fn load_manifest(path: &Path) -> Result<Manifest> {
-    if !path.exists() {
-        return Ok(Manifest::default());
-    }
-
-    let content = fs::read_to_string(path)
-        .await
-        .with_context(|| format!("failed to read manifest {}", path.display()))?;
-    let parsed = serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse manifest {}", path.display()))?;
-    Ok(parsed)
-}
-
-async fn save_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create manifest dir {}", parent.display()))?;
-    }
-
-    let data = serde_json::to_string_pretty(manifest).context("failed to serialize manifest")?;
-    fs::write(path, data)
-        .await
-        .with_context(|| format!("failed to write manifest {}", path.display()))?;
-    Ok(())
 }
 
 fn normalize_url(url: &Url) -> String {
