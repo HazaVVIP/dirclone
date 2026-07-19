@@ -9,7 +9,7 @@
 set -euo pipefail
 
 HOST="Haza@38.47.85.195"
-REMOTE_DIR="/home/Haza/dirclone-dev"
+REMOTE_DIR="/home/Haza/dirclone"
 LOCAL_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 run_tests=1
