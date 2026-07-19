@@ -4,6 +4,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use url::Url;
 
+/// Where a listing entry came from. A `ListingFile` is a path the parent
+/// listing advertised as a file — even if the server later serves it as
+/// text/html, we must save it (it's a real file the operator wants cloned).
+/// A `DirCandidate` is a URL we intend to crawl as a directory; an html body
+/// there is the listing itself, not a file to save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntrySource {
+    ListingFile,
+    DirCandidate,
+}
+
 #[derive(Debug, Clone)]
 pub struct ListingEntry {
     pub url: Url,
@@ -34,14 +45,14 @@ pub struct Stats {
 
 impl Stats {
     pub fn summarize(&self) {
-        eprintln!(
+        crate::progress::println(&format!(
             "Summary: dirs={}, downloaded={}, skipped={}, failed={}, warnings={}",
             self.dirs_processed,
             self.files_downloaded,
             self.files_skipped,
             self.files_failed,
             self.warnings
-        );
+        ));
     }
 
     pub fn final_status(&self) -> FinalStatus {
@@ -57,4 +68,5 @@ impl Stats {
 pub struct DownloadTask {
     pub file_url: Url,
     pub relative_path: PathBuf,
+    pub source: EntrySource,
 }

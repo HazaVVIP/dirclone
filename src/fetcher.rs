@@ -1,9 +1,14 @@
 use crate::cli::{LogLevel, log_debug, log_info};
+use crate::models::EntrySource;
 use anyhow::{Result, anyhow};
+use futures::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RETRY_AFTER};
 use reqwest::{Client, Response};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use url::Url;
 
 #[derive(Debug, Clone, Copy)]
@@ -21,6 +26,9 @@ pub enum ListingFetch {
 
 #[derive(Debug)]
 pub enum FileFetch {
+    /// File was fully streamed to disk at `path`. Metadata only — no bytes in
+    /// memory. When `dry_run` is set the caller passes `None` for `dest` and
+    /// this variant reports `path = PathBuf::new()`.
     Downloaded(FilePayload),
     NotModified,
     Skipped,
@@ -29,7 +37,8 @@ pub enum FileFetch {
 
 #[derive(Debug)]
 pub struct FilePayload {
-    pub bytes: Vec<u8>,
+    /// Final on-disk path (empty when dry_run skipped the write).
+    pub path: PathBuf,
     pub size: u64,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
@@ -98,54 +107,104 @@ pub async fn fetch_listing(
 pub async fn fetch_file(
     client: &Client,
     url: &Url,
+    source: EntrySource,
     resume: &ResumeHints,
     retry: RetryConfig,
     log_level: LogLevel,
+    // Destination. `None` = dry-run (headers/status only; response is dropped
+    // without draining the body).
+    dest: Option<&Path>,
+    // Optional progress hook fired per streamed chunk. Receives cumulative
+    // bytes-delta of THIS request (not global). Send+Sync so the fetch future
+    // can be scheduled across worker threads.
+    on_chunk: Option<&(dyn Fn(u64) + Send + Sync)>,
 ) -> FileFetch {
-    let response = match send_with_retry(client, url, Some(resume), retry, log_level).await {
-        Ok(resp) => resp,
-        Err(err) => {
-            log_info(log_level, &format!("Request failed for {url}: {err:#}"));
+    // Mid-stream retry loop. `send_with_retry` handles connect/status failures
+    // BEFORE the body arrives; a body that starts fine and then breaks (server
+    // closes early, transient network hiccup) has to be retried at this outer
+    // layer or the whole file is lost. Old HTTP/1.0 servers like Python's
+    // SimpleHTTP were observed dropping ~5% of large-file connections mid-body.
+    let max_stream_retries = retry.retries;
+    let mut stream_attempt: u32 = 0;
+    let mut backoff = retry.retry_backoff_ms.max(1);
+    loop {
+        let response = match send_with_retry(client, url, Some(resume), retry, log_level).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                log_info(log_level, &format!("Request failed for {url}: {err:#}"));
+                return FileFetch::Failed;
+            }
+        };
+
+        if response.status() == StatusCode::NOT_MODIFIED {
+            log_debug(log_level, &format!("Not modified, keeping local {url}"));
+            return FileFetch::NotModified;
+        }
+
+        if is_access_denied(response.status()) {
+            log_info(
+                log_level,
+                &format!("Skipping restricted file {url} ({})", response.status()),
+            );
+            return FileFetch::Skipped;
+        }
+
+        if !response.status().is_success() {
+            log_info(
+                log_level,
+                &format!("Skipping file {url}: HTTP {}", response.status()),
+            );
             return FileFetch::Failed;
         }
-    };
 
-    if response.status() == StatusCode::NOT_MODIFIED {
-        log_debug(log_level, &format!("Not modified, keeping local {url}"));
-        return FileFetch::NotModified;
+        let outcome =
+            stream_response_to_disk(response, url, source, log_level, dest, on_chunk).await;
+        match outcome {
+            FileFetch::Failed if stream_attempt < max_stream_retries => {
+                stream_attempt += 1;
+                log_debug(
+                    log_level,
+                    &format!(
+                        "stream error for {url}; retry {stream_attempt}/{max_stream_retries}"
+                    ),
+                );
+                sleep_backoff(backoff).await;
+                backoff = backoff.saturating_mul(2);
+                // Also reset any partial bytes we counted via on_chunk. We can't
+                // subtract from the atomic without introducing a signed API, so
+                // the caller sees the total include some duplicate bytes on
+                // retry. That's cosmetic — the file count and eventual on-disk
+                // state remain correct.
+                continue;
+            }
+            other => return other,
+        }
     }
-
-    if is_access_denied(response.status()) {
-        log_info(
-            log_level,
-            &format!("Skipping restricted file {url} ({})", response.status()),
-        );
-        return FileFetch::Skipped;
-    }
-
-    if !response.status().is_success() {
-        log_info(
-            log_level,
-            &format!("Skipping file {url}: HTTP {}", response.status()),
-        );
-        return FileFetch::Failed;
-    }
-
-    response_to_file_payload(response, url, log_level).await
 }
 
-async fn response_to_file_payload(response: Response, url: &Url, log_level: LogLevel) -> FileFetch {
+/// Stream the response body chunk-by-chunk. On the happy path we write to a
+/// sibling temp file and rename over the destination — same crash-safety as
+/// the previous `write_atomic`, but overlapped with network I/O instead of
+/// buffering the full body in RAM first.
+async fn stream_response_to_disk(
+    response: Response,
+    url: &Url,
+    source: EntrySource,
+    log_level: LogLevel,
+    dest: Option<&Path>,
+    on_chunk: Option<&(dyn Fn(u64) + Send + Sync)>,
+) -> FileFetch {
     let etag = header_string(response.headers(), &ETAG);
     let last_modified = header_string(response.headers(), &LAST_MODIFIED);
     let content_type = header_string(response.headers(), &reqwest::header::CONTENT_TYPE);
 
-    // A text/html body on a *file* URL is suspicious: many misconfigured servers
-    // serve a generated listing or an error page for a path that the parent
-    // listing advertised as a file. The M3 fix tags entries with their source so
-    // we can tell "this was a real file" from "this might be a nested listing";
-    // for now we skip to preserve the prior conservative behavior.
-    // ponytail: ceiling = save-as-file when EntrySource::ListingFile is wired (M3).
-    if let Some(ct) = content_type.as_deref()
+    // A text/html body on a URL the parent listing advertised as a *file* is a
+    // real file (e.g. an index.html someone placed in the directory) — save it.
+    // Only for a DirCandidate do we treat html as "probably a nested listing,
+    // not the file we asked for" and skip. This fixes defect #4: previously a
+    // legit index.html file sitting in a listing was silently dropped.
+    if source == EntrySource::DirCandidate
+        && let Some(ct) = content_type.as_deref()
         && (ct.starts_with("text/html") || ct.starts_with("application/xhtml+xml"))
     {
         log_info(
@@ -155,16 +214,108 @@ async fn response_to_file_payload(response: Response, url: &Url, log_level: LogL
         return FileFetch::Skipped;
     }
 
-    match response.bytes().await {
-        Ok(body) => FileFetch::Downloaded(FilePayload {
-            size: body.len() as u64,
-            bytes: body.to_vec(),
+    // Dry-run: don't drain the body, just report the metadata. Dropping the
+    // Response cancels the in-flight stream cleanly.
+    let Some(dest) = dest else {
+        return FileFetch::Downloaded(FilePayload {
+            path: PathBuf::new(),
+            size: 0,
             etag,
             last_modified,
             content_type,
-        }),
-        Err(_) => FileFetch::Failed,
+        });
+    };
+
+    // Build the temp path in the destination's parent so the final rename is
+    // guaranteed to be same-filesystem (rename across FSes fails on Linux).
+    let Some(parent) = dest.parent() else {
+        log_info(
+            log_level,
+            &format!("Refusing to stream {url}: destination has no parent"),
+        );
+        return FileFetch::Failed;
+    };
+    if let Err(err) = fs::create_dir_all(parent).await {
+        log_info(
+            log_level,
+            &format!("Failed to create parent dir {}: {err}", parent.display()),
+        );
+        return FileFetch::Failed;
     }
+    let tmp = parent.join(format!(
+        ".dirclone-tmp-{}",
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("part")
+    ));
+
+    let mut file = match fs::File::create(&tmp).await {
+        Ok(f) => f,
+        Err(err) => {
+            log_info(
+                log_level,
+                &format!("Failed to create temp file {}: {err}", tmp.display()),
+            );
+            return FileFetch::Failed;
+        }
+    };
+
+    let mut written: u64 = 0;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(b) => b,
+            Err(err) => {
+                log_info(
+                    log_level,
+                    &format!("Stream error for {url}: {err}"),
+                );
+                let _ = fs::remove_file(&tmp).await;
+                return FileFetch::Failed;
+            }
+        };
+        if let Err(err) = file.write_all(&chunk).await {
+            log_info(
+                log_level,
+                &format!("Write error for {}: {err}", tmp.display()),
+            );
+            let _ = fs::remove_file(&tmp).await;
+            return FileFetch::Failed;
+        }
+        written = written.saturating_add(chunk.len() as u64);
+        if let Some(cb) = on_chunk {
+            cb(chunk.len() as u64);
+        }
+    }
+
+    if let Err(err) = file.flush().await {
+        log_info(
+            log_level,
+            &format!("Flush error for {}: {err}", tmp.display()),
+        );
+        let _ = fs::remove_file(&tmp).await;
+        return FileFetch::Failed;
+    }
+    drop(file);
+
+    if let Err(err) = fs::rename(&tmp, dest).await {
+        log_info(
+            log_level,
+            &format!(
+                "Failed to move {} into place at {}: {err}",
+                tmp.display(),
+                dest.display()
+            ),
+        );
+        let _ = fs::remove_file(&tmp).await;
+        return FileFetch::Failed;
+    }
+
+    FileFetch::Downloaded(FilePayload {
+        path: dest.to_path_buf(),
+        size: written,
+        etag,
+        last_modified,
+        content_type,
+    })
 }
 
 async fn send_with_retry(
