@@ -15,12 +15,31 @@ pub fn parse_listing_entries(body: &str, current_url: &Url) -> Vec<ListingEntry>
     let mut entries = Vec::new();
     let mut dedupe = HashSet::new();
 
-    if matches!(format, ListingFormat::Html | ListingFormat::Unknown) {
-        parse_html_entries(body, current_url, &mut entries, &mut dedupe);
-    }
-
-    if entries.is_empty() || matches!(format, ListingFormat::PlainText | ListingFormat::Unknown) {
-        parse_plain_text_entries(body, current_url, &mut entries, &mut dedupe);
+    match format {
+        ListingFormat::Html => {
+            // HTML body: only harvest <a href="..."> anchors. If the HTML has
+            // ZERO anchors it isn't a directory listing at all — it's a file
+            // that the server chose to serve as text/html (e.g. an SPA index
+            // that Python SimpleHTTP will hand out when you GET a directory
+            // that happens to contain index.html). Falling through to the
+            // plain-text scan would then treat every attribute-looking token
+            // ('name="viewport"', 'content="width=device-width,') as a href
+            // and drown the crawler in 404s. Returning empty tells the caller
+            // "no children here" — cheap and correct.
+            parse_html_entries(body, current_url, &mut entries, &mut dedupe);
+        }
+        ListingFormat::PlainText => {
+            parse_plain_text_entries(body, current_url, &mut entries, &mut dedupe);
+        }
+        ListingFormat::Unknown => {
+            // No HTML markers and no plain-text lines — probably an empty
+            // response or one whose format we can't classify. Try both
+            // parsers cheaply; either produces zero entries on gibberish.
+            parse_html_entries(body, current_url, &mut entries, &mut dedupe);
+            if entries.is_empty() {
+                parse_plain_text_entries(body, current_url, &mut entries, &mut dedupe);
+            }
+        }
     }
 
     entries
@@ -179,5 +198,41 @@ mod tests {
         let entries = parse_listing_entries(body, &current);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].url.as_str(), "http://example.com/root/file.txt");
+    }
+
+    /// Regression test: an SPA index served under a "directory-looking" URL
+    /// (e.g. Python SimpleHTTP finds index.html when you GET foo/) MUST NOT
+    /// be misparsed. Previously the HTML pass found zero anchors, so the
+    /// plain-text fallback ate meta-tag attributes like `name="viewport"`
+    /// and `content="width=device-width,` as filenames, producing garbled
+    /// 404 URLs.
+    #[test]
+    fn html_with_no_anchors_yields_no_entries() {
+        let current = Url::parse("http://example.com/nhda_app/").unwrap();
+        let body = r#"<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, user-scalable=no, initial-scale=1.0"
+    />
+    <title></title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>"#;
+
+        let entries = parse_listing_entries(body, &current);
+        assert!(
+            entries.is_empty(),
+            "SPA index must yield zero entries, got: {:?}",
+            entries
+                .iter()
+                .map(|e| e.url.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }
