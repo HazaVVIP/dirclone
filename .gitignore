@@ -1,1 +1,6 @@
 /target
+# Session/skills data cloned from live targets while developing.
+# Contains third-party operator data — never commit.
+/test123/
+# Local manifest from ad-hoc test runs.
+.dirclone-manifest.json
