@@ -169,13 +169,25 @@ pub async fn fetch_file(
                     ),
                 );
                 sleep_backoff(backoff).await;
-                backoff = backoff.saturating_mul(2);
-                // Also reset any partial bytes we counted via on_chunk. We can't
-                // subtract from the atomic without introducing a signed API, so
-                // the caller sees the total include some duplicate bytes on
-                // retry. That's cosmetic — the file count and eventual on-disk
-                // state remain correct.
+                // Cap the backoff so a series of stream failures doesn't wait
+                // minutes between attempts. 8× the base is a reasonable ceiling.
+                backoff = backoff
+                    .saturating_mul(2)
+                    .min(retry.retry_backoff_ms.saturating_mul(8).max(2000));
                 continue;
+            }
+            FileFetch::Failed => {
+                // Retries exhausted — surface at info level so the user knows
+                // this file is genuinely gone. The mid-retry attempts stayed
+                // silent (log_debug) to avoid flooding the terminal.
+                log_info(
+                    log_level,
+                    &format!(
+                        "Stream error for {url}: gave up after {} attempts",
+                        max_stream_retries + 1
+                    ),
+                );
+                return FileFetch::Failed;
             }
             other => return other,
         }
@@ -264,9 +276,14 @@ async fn stream_response_to_disk(
         let chunk = match chunk {
             Ok(b) => b,
             Err(err) => {
-                log_info(
+                // Downgraded from log_info to log_debug: the outer retry
+                // loop in fetch_file logs the FINAL failure at info level
+                // once all retries are exhausted. Every mid-retry attempt
+                // being logged at info flooded the terminal on flaky
+                // slow-server targets.
+                log_debug(
                     log_level,
-                    &format!("Stream error for {url}: {err}"),
+                    &format!("stream chunk error for {url} @ {written}B: {err}"),
                 );
                 let _ = fs::remove_file(&tmp).await;
                 return FileFetch::Failed;
@@ -391,7 +408,24 @@ fn retry_after_ms(response: &Response) -> Option<u64> {
 
 async fn sleep_backoff(wait_ms: u64) {
     if wait_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        // Full-jitter: pick a random delay uniformly in [0, wait_ms]. Prevents
+        // a thundering herd of parallel workers from all retrying at the same
+        // moment against a server that's already under stress. Source of
+        // randomness is nanoseconds-since-UNIX-epoch mixed through a hash —
+        // good enough for backoff spread; we don't need cryptographic
+        // randomness here.
+        use std::time::SystemTime;
+        let now_ns = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // Mix so back-to-back reads from adjacent workers (which see almost
+        // identical clocks) produce well-separated jitter values.
+        let mixed = now_ns
+            .wrapping_mul(0x9E3779B97F4A7C15)
+            .wrapping_add(0xBF58476D1CE4E5B9);
+        let jitter = mixed % wait_ms.max(1);
+        tokio::time::sleep(Duration::from_millis(jitter)).await;
     }
 }
 

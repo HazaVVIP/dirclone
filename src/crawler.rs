@@ -64,10 +64,17 @@ pub async fn run(config: &AppConfig) -> Result<FinalStatus> {
     };
 
     let client = Client::builder()
-        // Read/total-request budget. Distinct from connect_timeout so a healthy
-        // but slow byte stream doesn't get killed by an aggressive fail-fast.
-        .timeout(Duration::from_secs(config.timeout_seconds))
+        // Wall-clock cap for the entire request. Default is 0 (disabled) so a
+        // legitimately-slow multi-hundred-MB file at slow-server-speeds isn't
+        // killed halfway. If the user asks for a positive cap we honour it.
         .connect_timeout(Duration::from_secs(config.connect_timeout))
+        // Per-read idle timeout: resets every time bytes arrive. This is what
+        // actually catches stalled connections without punishing slow-but-live
+        // ones. Root fix for the "Stream error / error decoding response body"
+        // symptom that appeared on large files under the previous wall-clock
+        // timeout (a 200 MB body at 300 KB/s legitimately takes 11 minutes
+        // and used to fail at 60s).
+        .read_timeout(Duration::from_secs(config.read_timeout))
         .user_agent(config.user_agent.clone())
         .redirect(Policy::limited(config.max_redirects))
         // Compression: HTML listings compress ~10× and hermes-style .git
@@ -83,7 +90,13 @@ pub async fn run(config: &AppConfig) -> Result<FinalStatus> {
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_keepalive(Duration::from_secs(30))
-        .tcp_nodelay(true)
+        .tcp_nodelay(true);
+    let client = if config.timeout_seconds > 0 {
+        client.timeout(Duration::from_secs(config.timeout_seconds))
+    } else {
+        client
+    };
+    let client = client
         .build()
         .context("failed to create HTTP client")?;
 

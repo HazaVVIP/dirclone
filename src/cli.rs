@@ -18,11 +18,22 @@ pub struct Cli {
     /// back to the host when the URL points at the root.
     pub output: Option<PathBuf>,
 
-    /// Total request timeout in seconds (connect + read). Set high enough to
-    /// let genuinely-large files finish; the separate --connect-timeout keeps
-    /// unreachable hosts from stalling this budget.
-    #[arg(long, default_value_t = 60)]
+    /// Overall request timeout in seconds. Wall-clock cap for a single
+    /// request (connect + all reads). Set 0 to disable — the per-read
+    /// --read-timeout will still catch stalled connections. Default is 0
+    /// (disabled) because a healthy multi-hundred-MB download at slow-server
+    /// speeds legitimately takes many minutes, and prematurely killing it
+    /// causes the "Stream error / error decoding response body" symptom
+    /// on files like state.db or bin/tirith.
+    #[arg(long, default_value_t = 0)]
     pub timeout_seconds: u64,
+
+    /// Per-read idle timeout in seconds. Resets every time bytes arrive, so
+    /// a slow-but-alive body doesn't get killed — only truly stalled
+    /// connections do. This is the anti-hang guarantee: if the server stops
+    /// sending for `--read-timeout` seconds, the request is retried.
+    #[arg(long, default_value_t = 30)]
+    pub read_timeout: u64,
 
     /// Connect-phase timeout in seconds. Fail-fast on TCP-unreachable hosts
     /// without eating into the read budget of healthy connections.
@@ -33,8 +44,11 @@ pub struct Cli {
     #[arg(long, default_value = "dirclone/0.2")]
     pub user_agent: String,
 
-    /// Maximum retries for transient errors
-    #[arg(long, default_value_t = 2)]
+    /// Maximum retries for transient errors (connect refuses, mid-stream body
+    /// drops, 429/5xx). Default 4 = up to 5 total attempts per URL. Slow
+    /// HTTP/1.0 targets like Python SimpleHTTP tend to drop ~5% of large-file
+    /// connections mid-body under load — retries recover the vast majority.
+    #[arg(long, default_value_t = 4)]
     pub retries: u32,
 
     /// Base backoff between retries in milliseconds
@@ -110,6 +124,7 @@ pub struct AppConfig {
     pub root_url: Url,
     pub output: PathBuf,
     pub timeout_seconds: u64,
+    pub read_timeout: u64,
     pub connect_timeout: u64,
     pub user_agent: String,
     pub retries: u32,
@@ -156,6 +171,7 @@ impl TryFrom<Cli> for AppConfig {
             root_url,
             output,
             timeout_seconds: value.timeout_seconds,
+            read_timeout: value.read_timeout,
             connect_timeout: value.connect_timeout,
             user_agent: value.user_agent,
             retries: value.retries,
@@ -258,6 +274,7 @@ mod tests {
             url: "http://1.2.3.4:8080/.hermes".to_string(),
             output: None,
             timeout_seconds: 20,
+            read_timeout: 30,
             connect_timeout: 8,
             user_agent: "x".into(),
             retries: 0,

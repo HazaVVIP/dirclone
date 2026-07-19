@@ -10,6 +10,7 @@ fn base_config(root_url: Url, output: std::path::PathBuf) -> AppConfig {
         root_url,
         output,
         timeout_seconds: 10,
+        read_timeout: 30,
         connect_timeout: 5,
         user_agent: "dirclone-test".to_string(),
         retries: 1,
